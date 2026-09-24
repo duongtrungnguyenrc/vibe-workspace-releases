@@ -1,0 +1,117 @@
+# Turns a delivery from the (private) Vibe Workspace source repository into a GitHub Release here.
+#
+# The source repository's "Desktop release" workflow builds the installers, then pushes them over an SSH deploy key
+# to a branch `incoming/v<version>`: every file, with files over GitHub's 100 MB limit split into parts, plus
+# SHA256SUMS.txt, release-notes.md and release.json. A deploy key can push git but cannot call the API, so this
+# workflow finishes the job with this repository's own short-lived token: it joins the parts back, checks every file
+# against SHA256SUMS.txt, publishes (or updates) the release, and deletes the incoming branch.
+name: Publish release
+
+on:
+  push:
+    branches:
+      - 'incoming/**'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the delivery
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 1
+
+      - name: Read the delivery
+        id: delivery
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          dir="incoming/${BRANCH#incoming/}"
+          if [ ! -f "$dir/release.json" ]; then
+            echo "::error::$dir/release.json is missing; this branch is not a delivery"
+            exit 1
+          fi
+          tag=$(jq -r '.tag' "$dir/release.json")
+          version=$(jq -r '.version' "$dir/release.json")
+          prerelease=$(jq -r '.prerelease' "$dir/release.json")
+          # Only a plain version tag gets any further: it becomes a git tag and part of shell commands below.
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' || [ "$tag" != "v$version" ]; then
+            echo "::error::release.json names an invalid tag: $tag"
+            exit 1
+          fi
+          if [ "incoming/$tag" != "$BRANCH" ]; then
+            echo "::error::branch $BRANCH does not match the delivered tag $tag"
+            exit 1
+          fi
+          {
+            echo "dir=$dir"
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Join the split files and verify every checksum
+        working-directory: ${{ steps.delivery.outputs.dir }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for first in *.part-000; do
+            file="${first%.part-000}"
+            cat -- "$file".part-* > "$file"
+            rm -- "$file".part-*
+            echo "joined $file"
+          done
+          sha256sum -c SHA256SUMS.txt
+          # Every file shipped must be listed: nothing unverified reaches the release.
+          for file in *; do
+            case "$file" in release.json|release-notes.md|SHA256SUMS.txt) continue ;; esac
+            if ! grep -q "  $file\$" SHA256SUMS.txt; then
+              echo "::error::$file is not listed in SHA256SUMS.txt"
+              exit 1
+            fi
+          done
+
+      - name: Publish the release
+        working-directory: ${{ steps.delivery.outputs.dir }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.delivery.outputs.tag }}
+          VERSION: ${{ steps.delivery.outputs.version }}
+          PRERELEASE: ${{ steps.delivery.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          files=()
+          for file in *; do
+            case "$file" in release.json|release-notes.md) continue ;; esac
+            files+=("$file")
+          done
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Release $TAG exists; replacing its files."
+            gh release upload "$TAG" --clobber "${files[@]}"
+            gh release edit "$TAG" --draft=false --notes-file release-notes.md
+          else
+            flags=(--title "Vibe Workspace $VERSION" --notes-file release-notes.md --target "${{ github.event.repository.default_branch }}")
+            if [ "$PRERELEASE" = "true" ]; then
+              flags+=(--prerelease --latest=false)
+            else
+              flags+=(--latest)
+            fi
+            gh release create "$TAG" "${flags[@]}" "${files[@]}"
+          fi
+          url="https://github.com/${{ github.repository }}/releases/tag/$TAG"
+          echo "Published [$TAG]($url)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the incoming branch
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: git push origin --delete "$BRANCH"
